@@ -1,0 +1,137 @@
+import os
+import re
+import shutil
+import base64
+from pathlib import Path
+from magic_pdf.data.data_reader_writer import FileBasedDataWriter, FileBasedDataReader
+from magic_pdf.data.dataset import PymuDocDataset
+from magic_pdf.model.doc_analyze_by_custom_model import doc_analyze
+from magic_pdf.config.enums import SupportedPdfParseMethod
+from openai import OpenAI
+import convertapi
+
+# ------------------ 全局配置 ------------------
+# ConvertAPI 配置
+convertapi.api_credentials = 'secret_HFA4yLSlXBBCZlPe'
+input_docx = r"C:\Users\HP\Desktop\test3.docx"
+output_dir = r"C:\Users\HP\Desktop\output_step3"
+
+# PDF处理配置
+kimi_api_key = "sk-3scaeuq5Pvut0jW1d7YsAQV3fkXr3X6rfwk61IEDzgqHUxhG"
+
+# ------------------ 函数定义 ------------------
+def convert_docx_to_pdf():
+    """将DOCX转换为PDF并返回路径"""
+    print("▌ 开始转换DOCX到PDF...")
+    pdf_name = Path(input_docx).stem + ".pdf"
+    pdf_path = os.path.join(output_dir, pdf_name)
+    
+    convertapi.convert('pdf', {'File': input_docx}, from_format='docx').save_files(output_dir)
+    print(f"✅ DOCX转换完成 → {pdf_path}")
+    return pdf_path
+
+def process_pdf(pdf_path):
+    """处理PDF生成Markdown"""
+    print("▌ 开始解析PDF...")
+    base_name = Path(pdf_path).stem
+    image_dir = os.path.join(output_dir, "images")
+    md_dir = os.path.join(output_dir, base_name)
+    
+    # 初始化目录
+    os.makedirs(image_dir, exist_ok=True)
+    os.makedirs(md_dir, exist_ok=True)
+
+    # 读取PDF
+    reader = FileBasedDataReader("")
+    pdf_bytes = reader.read(pdf_path)
+    
+    # 处理逻辑
+    dataset = PymuDocDataset(pdf_bytes)
+    if dataset.classify() == SupportedPdfParseMethod.OCR:
+        result = dataset.apply(doc_analyze, ocr=True)
+        pipeline = result.pipe_ocr_mode(FileBasedDataWriter(image_dir))
+    else:
+        result = dataset.apply(doc_analyze, ocr=False)
+        pipeline = result.pipe_txt_mode(FileBasedDataWriter(image_dir))
+    
+    # 生成Markdown
+    md_file = os.path.join(md_dir, f"{base_name}.md")
+    pipeline.dump_md(
+        FileBasedDataWriter(md_dir),
+        f"{base_name}.md",
+        os.path.basename(image_dir)
+    )
+    return md_file, image_dir
+
+def analyze_images(md_file, image_dir):
+    """分析图片并更新Markdown"""
+    print("▌ 开始图片分析...")
+    client = OpenAI(api_key=kimi_api_key, base_url="https://api.moonshot.cn/v1")
+    
+    with open(md_file, 'r', encoding='utf-8') as f:
+        md_content = f.read()
+    
+    for img_file in os.listdir(image_dir):
+        if not img_file.lower().endswith(('.png', '.jpg', '.jpeg')):
+            continue
+            
+        pattern = re.compile(rf"!\[\]\(images/{re.escape(img_file)}\)")
+        if not pattern.search(md_content):
+            print(f"⏩ 跳过未引用图片: {img_file}")
+            continue
+
+        img_path = os.path.join(image_dir, img_file)
+        try:
+            # 准备图片数据
+            with open(img_path, "rb") as f:
+                image_data = base64.b64encode(f.read()).decode('utf-8')
+            image_url = f"data:image/{Path(img_file).suffix[1:]};base64,{image_data}"
+            
+            # 调用Kimi API
+            response = client.chat.completions.create(
+                model="moonshot-v1-128k-vision-preview",
+                messages=[
+                    {"role": "system", "content": "专业图像分析助手，需完整描述所有内容"},
+                    {"role": "user", "content": [
+                        {"type": "image_url", "image_url": {"url": image_url}},
+                        {"type": "text", "text": "详细描述布局图，重点说明位置关系和空间结构"}
+                    ]}
+                ]
+            )
+            analysis = response.choices[0].message.content
+            
+            # 更新Markdown
+            update_markdown(md_file, img_file, analysis)
+            
+        except Exception as e:
+            print(f"⚠️ 图片处理异常 {img_file}: {str(e)}")
+
+def update_markdown(md_file, img_file, content):
+    """更新Markdown文件"""
+    try:
+        with open(md_file, 'r+', encoding='utf-8') as f:
+            text = f.read()
+            new_text = re.sub(
+                rf"!\[\]\(images/{re.escape(img_file)}\)",
+                content,
+                text
+            )
+            f.seek(0)
+            f.write(new_text)
+            f.truncate()
+        print(f"✅ 更新 {img_file} 完成")
+    except Exception as e:
+        print(f"❌ 更新失败: {str(e)}")
+
+# ------------------ 主流程 ------------------
+if __name__ == "__main__":
+    # Step 1: DOCX转PDF
+    pdf_path = convert_docx_to_pdf()
+    
+    # Step 2: 处理PDF生成Markdown
+    md_file, image_dir = process_pdf(pdf_path)
+    
+    # Step 3: 分析并更新图片
+    analyze_images(md_file, image_dir)
+    
+    print("🎉 全流程执行完毕！")
